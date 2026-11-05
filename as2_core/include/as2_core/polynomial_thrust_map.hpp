@@ -163,7 +163,7 @@ private:
   // Coefficients of the correction factor polynomial:
   // gamma = gamma2 * V^2 + gamma1 * V + gamma0
   double gamma2, gamma1, gamma0;
-  uint n_motors;
+  unsigned int n_motors;
 
 protected:
   as2::AerialPlatform * platform_node_ptr_;

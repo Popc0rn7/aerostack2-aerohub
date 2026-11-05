@@ -157,7 +157,7 @@ class LaunchConfigurationFromConfigFile(launch.substitution.Substitution):
                 aside_dict['/**']['ros__parameters'] = data['/**']['ros__parameters']
                 data['/**'].pop('ros__parameters')
                 if not data['/**']:
-                    data = {}
+                    data.pop('/**')
 
         temp_yaml_file = tempfile.NamedTemporaryFile(mode='w', delete=False)
 
