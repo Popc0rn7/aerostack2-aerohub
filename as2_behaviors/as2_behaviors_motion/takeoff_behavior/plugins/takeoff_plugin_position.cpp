@@ -139,7 +139,7 @@ private:
   bool checkGoalCondition()
   {
     if (localization_flag_) {
-      if (fabs(goal_.takeoff_height - feedback_.actual_takeoff_height) <
+      if (fabs(takeoff_position_.z - feedback_.actual_takeoff_height) <
         params_.takeoff_threshold)
       {
         return true;
