@@ -98,6 +98,8 @@ private:
 
 protected:
   float cmd_freq_;
+  double trajectory_max_age_ = 0.3;
+  double trajectory_max_future_ = 0.05;
   float info_freq_;
 
   // Available to platform implementations, so that they do not need their own

@@ -45,7 +45,9 @@ void AerialPlatform::initialize()
 {
   {
     resetPlatform();
-    cmd_freq_ = this->getParameter<float>("cmd_freq", 100.0);
+    cmd_freq_ = this->getParameter<float>("cmd_freq", 50.0);
+    trajectory_max_age_ = this->getParameter<double>("trajectory.max_age", 0.3);
+    trajectory_max_future_ = this->getParameter<double>("trajectory.max_future", 0.05);
     info_freq_ = this->getParameter<float>("info_freq", 10.0);
 
     // Created up front, so that its buffer is filled before the first conversion,
@@ -56,7 +58,7 @@ void AerialPlatform::initialize()
 
     trajectory_command_sub_ = this->create_subscription<as2_msgs::msg::TrajectorySetpoints>(
       this->generate_global_name(as2_names::topics::actuator_command::trajectory),
-      as2_names::topics::actuator_command::qos,
+      rclcpp::QoS(1).best_effort(),
       [this](const as2_msgs::msg::TrajectorySetpoints::ConstSharedPtr msg) {
         this->command_trajectory_msg_ = *msg.get();
         has_new_references_ = true;
@@ -384,6 +386,10 @@ void AerialPlatform::sendCommand()
     RCLCPP_WARN_THROTTLE(this->get_logger(), clk, 1000, "SEND PLATFORM STOP COMMAND");
     ownStopPlatform();
   } else if (has_new_references_) {
+    if (platform_info_msg_.current_control_mode.control_mode == as2_msgs::msg::ControlMode::TRAJECTORY) {
+      const double age = (this->now() - rclcpp::Time(command_trajectory_msg_.header.stamp)).seconds();
+      if (age > trajectory_max_age_ || age < -trajectory_max_future_) {return;}
+    }
     // Zero timeout: use the latest cached transform, never block the command timer
     if (!as2::control_mode::convertCommandsToFrame(
         *tf_handler_, command_pose_frame_id_, command_twist_frame_id_,

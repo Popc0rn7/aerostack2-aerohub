@@ -37,6 +37,7 @@
 #include "as2_motion_controller/param_utils.hpp"
 
 #include <as2_core/utils/tf_utils.hpp>
+#include <stdexcept>
 
 namespace controller_handler
 {
@@ -107,7 +108,7 @@ ControllerHandler::ControllerHandler(
     as2_names::topics::motion_reference::twist, as2_names::topics::motion_reference::qos,
     std::bind(&ControllerHandler::refTwistCallback, this, std::placeholders::_1));
   ref_traj_sub_ = node_ptr_->create_subscription<as2_msgs::msg::TrajectorySetpoints>(
-    as2_names::topics::motion_reference::trajectory, as2_names::topics::motion_reference::qos,
+    as2_names::topics::motion_reference::trajectory, rclcpp::QoS(1).best_effort(),
     std::bind(&ControllerHandler::refTrajCallback, this, std::placeholders::_1));
   ref_thrust_sub_ = node_ptr_->create_subscription<as2_msgs::msg::Thrust>(
     as2_names::topics::motion_reference::thrust, as2_names::topics::motion_reference::qos,
@@ -145,6 +146,17 @@ ControllerHandler::ControllerHandler(
   list_control_modes_client_ =
     std::make_shared<as2::SynchronousServiceClient<as2_msgs::srv::ListControlModes>>(
     as2_names::services::platform::list_control_modes, node_ptr_);
+
+  hover_client_ = node_ptr_->create_client<as2_msgs::srv::SetControlMode>(
+    as2_names::services::controller::set_control_mode);
+  trajectory_freshness_.max_age = node_ptr_->getParameter<double>("trajectory.max_age", 0.3);
+  trajectory_freshness_.max_future = node_ptr_->getParameter<double>("trajectory.max_future", 0.05);
+  trajectory_freshness_.timeout = node_ptr_->getParameter<double>("trajectory.timeout", 0.5);
+  if (!(trajectory_freshness_.max_age > 0.0) ||
+    !(trajectory_freshness_.max_future >= 0.0) || !(trajectory_freshness_.timeout > 0.0))
+  {
+    throw std::invalid_argument("Invalid trajectory freshness limits");
+  }
 
   // Timers
   const double cmd_freq = node_ptr_->getParameter<double>("cmd_freq");
@@ -191,6 +203,10 @@ void ControllerHandler::getMode(
 {
   mode_in = control_mode_in_;
   mode_out = control_mode_out_;
+  if (!control_mode_established_) {
+    mode_in.control_mode = as2_msgs::msg::ControlMode::UNSET;
+    mode_out.control_mode = as2_msgs::msg::ControlMode::UNSET;
+  }
   return;
 }
 
@@ -215,6 +231,8 @@ void ControllerHandler::reset()
 {
   controller_ptr_->reset();
   last_time_ = node_ptr_->now();
+  trajectory_freshness_.reset(last_time_.seconds());
+  ref_traj_ = as2_msgs::msg::TrajectorySetpoints();
   state_acquired_ = false;
   ref_pose_acquired_ = false;
   ref_twist_acquired_ = false;
@@ -323,48 +341,22 @@ void ControllerHandler::refTwistCallback(const geometry_msgs::msg::TwistStamped:
 
 void ControllerHandler::refTrajCallback(const as2_msgs::msg::TrajectorySetpoints::SharedPtr msg)
 {
-  if ((!control_mode_established_ && !bypass_controller_) ||
-    control_mode_in_.control_mode == as2_msgs::msg::ControlMode::HOVER ||
-    control_mode_in_.control_mode == as2_msgs::msg::ControlMode::UNSET)
+  if (!control_mode_established_ ||
+    control_mode_in_.control_mode != as2_msgs::msg::ControlMode::TRAJECTORY)
   {
     return;
   }
-
-  auto & clk = *node_ptr_->get_clock();
-
-  if (msg->setpoints.empty()) {
-    RCLCPP_WARN_THROTTLE(
-      node_ptr_->get_logger(), clk, 1000,
-      "Received TrajectorySetpoints with empty setpoints array. Dropping.");
+  // Adapters must explicitly transform to the vehicle's local ENU odom.
+  // Avoid TF arithmetic on optional all-NaN derivatives.
+  if (msg->header.frame_id != node_ptr_->getOdomFrameId() || !as2::trajectory::valid(*msg) ||
+    !trajectory_freshness_.accept(
+      rclcpp::Time(msg->header.stamp).seconds(), node_ptr_->now().seconds()))
+  {
+    RCLCPP_WARN_THROTTLE(node_ptr_->get_logger(), *node_ptr_->get_clock(), 1000,
+      "Rejected invalid, duplicate, out-of-order or stale trajectory sample");
     return;
   }
-
-  // TrajectorySetpoints encodes pose and twist in the same frame: if the
-  // active mode in the plugin reports different frames for pose and twist,
-  // the plugin does not support trajectory references in this mode.
-  if (input_pose_frame_id_ != input_twist_frame_id_) {
-    RCLCPP_ERROR_THROTTLE(
-      node_ptr_->get_logger(), clk, 1000,
-      "Plugin expects different frames for pose ('%s') and twist ('%s') in "
-      "the active mode; trajectory references require both to be equal. "
-      "Dropping.",
-      input_pose_frame_id_.c_str(), input_twist_frame_id_.c_str());
-    return;
-  }
-
-  as2_msgs::msg::TrajectorySetpoints traj = *msg;
-  if (traj.header.frame_id != input_pose_frame_id_) {
-    if (!tf_handler_->tryConvert(traj, input_pose_frame_id_)) {
-      RCLCPP_ERROR_THROTTLE(
-        node_ptr_->get_logger(), clk, 1000,
-        "Cannot transform trajectory from '%s' to '%s' at time %f. Dropping.",
-        msg->header.frame_id.c_str(), input_pose_frame_id_.c_str(), rclcpp::Time(
-          traj.header.stamp).seconds());
-      return;
-    }
-  }
-
-  ref_traj_ = traj;
+  ref_traj_ = *msg;
   ref_traj_acquired_ = true;
   if (!bypass_controller_) {controller_ptr_->updateReference(ref_traj_);}
 }
@@ -400,6 +392,8 @@ void ControllerHandler::setControlModeSrvCall(
   std::vector<std::pair<uint8_t, uint8_t>> mode_pairs;
 
   control_mode_established_ = false;
+  bypass_controller_ = false;
+  reset();
 
   // check if platform_available_modes is set
   if (!listPlatformAvailableControlModes()) {
@@ -421,7 +415,7 @@ void ControllerHandler::setControlModeSrvCall(
   // Check if a bypass is possible for the input_control_mode_desired ( DISCARDING REFERENCE
   // COMPONENT)
   bypass_controller_ = false;
-  if (use_bypass_) {
+  if (use_bypass_ || request->control_mode.control_mode == as2_msgs::msg::ControlMode::TRAJECTORY) {
     if (_control_mode_plugin_in == HOVER_MODE_MASK) {
       if (trySetPlatformHover()) {
         bypass_controller_ = true;
@@ -430,6 +424,14 @@ void ControllerHandler::setControlModeSrvCall(
     } else {
       bypass_controller_ = tryToBypassController(_control_mode_plugin_in, _control_mode_plugin_out);
     }
+  }
+
+  if (request->control_mode.control_mode == as2_msgs::msg::ControlMode::TRAJECTORY &&
+    (!bypass_controller_ || request->control_mode.yaw_mode != as2_msgs::msg::ControlMode::YAW_ANGLE))
+  {
+    RCLCPP_ERROR(node_ptr_->get_logger(), "Platform does not support direct trajectory with yaw angle");
+    response->success = false;
+    return;
   }
 
   if (bypass_controller_) {
@@ -595,6 +597,31 @@ void ControllerHandler::controlTimerCallback()
     auto & clock = *node_ptr_->get_clock();
     RCLCPP_INFO_THROTTLE(node_ptr_->get_logger(), clock, 10000, "Control mode not established");
     return;
+  }
+
+  if (control_mode_in_.control_mode == as2_msgs::msg::ControlMode::TRAJECTORY) {
+    const double now = node_ptr_->now().seconds();
+    if (trajectory_freshness_.expired(now)) {
+      // Latch before requesting hover. No new sample can resume this mode.
+      control_mode_established_ = false;
+      bypass_controller_ = false;
+      ref_traj_acquired_ = false;
+      RCLCPP_ERROR(node_ptr_->get_logger(), "Trajectory stream lost; requesting hover");
+      if (!hover_client_->service_is_ready()) {
+        RCLCPP_ERROR(node_ptr_->get_logger(), "Hover request failed: controller service unavailable");
+        return;
+      }
+      auto request = std::make_shared<as2_msgs::srv::SetControlMode::Request>();
+      request->control_mode.control_mode = as2_msgs::msg::ControlMode::HOVER;
+      hover_client_->async_send_request(request,
+        [this](rclcpp::Client<as2_msgs::srv::SetControlMode>::SharedFuture future) {
+          if (!future.get()->success) {
+            RCLCPP_ERROR(node_ptr_->get_logger(), "Trajectory failsafe hover FAILED");
+          }
+        });
+      return;
+    }
+    if (!trajectory_freshness_.executable(now)) {return;}
   }
 
   if (!state_acquired_ && !bypass_controller_) {
@@ -896,7 +923,6 @@ void ControllerHandler::publishDebug(const rclcpp::Time & tick)
   }
   if (debug_reference_trajectory_pub_ && ref_traj_acquired_) {
     auto msg = ref_traj_;
-    msg.header.stamp = tick;
     debug_reference_trajectory_pub_->publish(msg);
   }
 }

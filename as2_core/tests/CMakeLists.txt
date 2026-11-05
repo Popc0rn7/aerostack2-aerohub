@@ -17,3 +17,8 @@ foreach(TEST_SOURCE ${TEST_SOURCES})
   ament_target_dependencies(${TEST_NAME} ${PROJECT_DEPENDENCIES})
   target_link_libraries(${TEST_NAME} ${PROJECT_NAME} yaml-cpp::yaml-cpp)
 endforeach()
+
+add_executable(trajectory_contract_test trajectory/trajectory_contract_test.cpp)
+target_include_directories(trajectory_contract_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_compile_options(trajectory_contract_test PRIVATE -UNDEBUG)
+add_test(NAME trajectory_contract_test COMMAND trajectory_contract_test)

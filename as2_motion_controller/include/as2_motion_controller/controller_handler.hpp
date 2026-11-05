@@ -65,6 +65,7 @@
 #include "as2_msgs/srv/set_control_mode.hpp"
 
 #include "controller_base.hpp"
+#include "as2_core/utils/trajectory_reference.hpp"
 
 namespace controller_handler
 {
@@ -251,6 +252,8 @@ private:
   // Internal variables
   bool control_mode_established_ = false;
   bool hover_pending_ = false;
+  as2::trajectory::Freshness trajectory_freshness_;
+  rclcpp::Client<as2_msgs::srv::SetControlMode>::SharedPtr hover_client_;
 
   // References and state acquired flags.
   bool ref_pose_acquired_ = false;
